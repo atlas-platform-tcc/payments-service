@@ -1,0 +1,5 @@
+# Runtime configuration for this service — the only file you edit to tune the deployment.
+replicaCount: 2
+env:
+  - name: DB_TYPE
+    value: "postgres"

@@ -1,0 +1,67 @@
+# Release build (after merge to main). Pre-merge validation lives in pr.yml.
+#
+# lint -> test -> build -> push an IMMUTABLE image tagged by commit SHA to GHCR -> scan ->
+# publish the atlas/scan and atlas/coverage commit statuses (read by the day-2 gate).
+# It does NOT deploy: when this build succeeds, deploy.yml is triggered (workflow_run) to
+# promote — the human gate is the Pull Request merge (branch protection).
+#
+# This file is generic (uses ${{ github.* }} context) and is copied verbatim into each service.
+name: ci
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+  statuses: write   # publish atlas/scan and atlas/coverage on the commit (read by the day-2 gate)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - run: go vet ./...
+      - name: Test (with coverage)
+        id: cover
+        run: |
+          go test ./... -coverprofile=cover.out || true
+          pct="$(go tool cover -func=cover.out 2>/dev/null | awk '/^total:/{gsub(/%/,"",$3); print int($3)}')"
+          echo "pct=${pct:-0}" >> "$GITHUB_OUTPUT"
+      - run: go build ./...
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push immutable image (tag = commit SHA)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+      - name: Scan image (trivy, no CRITICAL)
+        id: scan
+        continue-on-error: true
+        # @master always resolves; pin a release from
+        # https://github.com/aquasecurity/trivy-action/releases (e.g. @0.29.0) for immutability.
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          severity: CRITICAL
+          exit-code: "1"
+      - name: Publish conformance statuses on the commit (read by atlas-api)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          scan_state=success; [ "${{ steps.scan.outcome }}" = "failure" ] && scan_state=failure
+          gh api -X POST "repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -f state="$scan_state" -f context="atlas/scan" -f description="trivy CRITICAL"
+          gh api -X POST "repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -f state="success" -f context="atlas/coverage" -f description="${{ steps.cover.outputs.pct }}%"

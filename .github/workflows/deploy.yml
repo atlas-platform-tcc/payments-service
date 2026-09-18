@@ -1,0 +1,114 @@
+# Deploy (day-2) for a generated service.
+#
+# Triggered automatically after the release build (ci) succeeds on a merge to main
+# (workflow_run) — the human gate is the Pull Request merge (branch protection). Also
+# available as a "Run workflow" button (workflow_dispatch) for redeploy/rollback by passing
+# an earlier SHA. Promotes the immutable image (tag = SHA) by pinning it in atlas-gitops;
+# Argo CD (syncPolicy: automated) reconciles. The day-2 conformance gate runs before promoting.
+#
+# This file is generic (uses ${{ github.* }} context) and is copied verbatim into each service.
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Image SHA to deploy (leave empty for the latest build; an earlier SHA rolls back)"
+        required: false
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # On workflow_run, only promote if the release build succeeded.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout service repo
+        uses: actions/checkout@v4
+      - name: Conformance check (day-2 gate)
+        # Sends only {image, replicas}; atlas-api VERIFIES the remaining facts (branch
+        # protection and the atlas/scan + atlas/coverage commit statuses published by CI) —
+        # ADR atlas-api/0019. Fails the deploy on 422. With ATLAS_ENFORCE=true it also fails
+        # when the check is not confirmed (any HTTP != 200, including an unreachable API).
+        if: ${{ vars.ATLAS_API_URL != '' }}
+        env:
+          ATLAS_API_URL: ${{ vars.ATLAS_API_URL }}
+          ATLAS_ENFORCE: ${{ vars.ATLAS_ENFORCE }}
+          SERVICE: ${{ github.event.repository.name }}
+          IMAGE_SHA: ${{ github.event.inputs.sha || github.event.workflow_run.head_sha || github.sha }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          REPLICAS="$(yq '.replicaCount // 1' deploy/values.yaml)"
+          IMAGE="ghcr.io/${OWNER}/${SERVICE}:${IMAGE_SHA}"
+          body="$(jq -nc --arg i "$IMAGE" --argjson r "${REPLICAS:-1}" '{image:$i,replicas:$r}')"
+          code=$(curl -s -o /tmp/conf.json -w '%{http_code}' -X POST "${ATLAS_API_URL}/services/${SERVICE}/conformance" \
+            -H 'content-type: application/json' -H 'X-Atlas-Actor: deploy-pipeline' -d "$body")
+          echo "conformance check → HTTP ${code}"; cat /tmp/conf.json 2>/dev/null || true; echo
+          if [ "${code}" = "422" ]; then
+            echo "::error::day-2 conformance gate failed — deploy refused"; exit 1
+          fi
+          if [ "${ATLAS_ENFORCE:-}" = "true" ] && [ "${code}" != "200" ]; then
+            echo "::error::ATLAS_ENFORCE: conformance not confirmed (HTTP ${code})"; exit 1
+          fi
+      - name: Promote image in atlas-gitops (auto-merge) so Argo CD applies it
+        env:
+          # GITOPS_TOKEN: a token with write access to atlas-gitops (the default
+          # GITHUB_TOKEN cannot push to another repository).
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          IMAGE_SHA: ${{ github.event.inputs.sha || github.event.workflow_run.head_sha || github.sha }}
+          SERVICE: ${{ github.event.repository.name }}
+          GITOPS_REPO: ${{ github.repository_owner }}/atlas-gitops
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${GITOPS_TOKEN}@github.com/${GITOPS_REPO}.git" gitops
+          DEST="gitops/apps/${SERVICE}/values.yaml"
+
+          # Guard: only PROMOTE an already-provisioned service. If the GitOps skeleton
+          # is not merged yet, fail fast instead of creating a half-deployed state.
+          if [ ! -f "$DEST" ]; then
+            echo "::error::service '${SERVICE}' is not provisioned in atlas-gitops yet — merge the provisioning PR before deploying."
+            exit 1
+          fi
+
+          # Pin the immutable image (tag = commit SHA) and propagate the dev-facing
+          # deploy/values.yaml (replicaCount + env). image.repository is kept as provisioned.
+          yq -i ".image.tag = \"${IMAGE_SHA}\"" "$DEST"
+          yq -i '.replicaCount = load("deploy/values.yaml").replicaCount' "$DEST"
+          yq -i '.env = (load("deploy/values.yaml").env // [])' "$DEST"
+
+          cd gitops
+          git config user.name  "atlas-deploy[bot]"
+          git config user.email "atlas-deploy@users.noreply.github.com"
+          git add "apps/${SERVICE}/values.yaml"
+          if git diff --cached --quiet; then
+            echo "No change — ${SERVICE} already at ${IMAGE_SHA}."
+            exit 0
+          fi
+          git commit -m "Deploy ${SERVICE} at ${IMAGE_SHA}"
+          git push origin main   # auto-merge of the bump; Argo CD (syncPolicy: automated) reconciles
+          echo "Promoted ${SERVICE}@${IMAGE_SHA} in atlas-gitops; Argo CD will reconcile."
+
+      - name: Report deploy event to Atlas (best-effort)
+        # The Atlas API records a deploy.promoted event (ADR atlas-api/0017). This runner
+        # is cloud-hosted and cannot reach a local Atlas API, so it is a no-op unless
+        # ATLAS_API_URL (a repo variable) points to a reachable API. Never fails the deploy.
+        if: success()
+        env:
+          ATLAS_API_URL: ${{ vars.ATLAS_API_URL }}
+          SERVICE: ${{ github.event.repository.name }}
+          IMAGE_SHA: ${{ github.event.inputs.sha || github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          if [ -z "${ATLAS_API_URL:-}" ]; then
+            echo "ATLAS_API_URL not set — skipping deploy event."
+            exit 0
+          fi
+          curl -fsS -X POST "${ATLAS_API_URL}/services/${SERVICE}/events" \
+            -H 'content-type: application/json' -H 'X-Atlas-Actor: deploy-pipeline' \
+            -d "{\"type\":\"deploy.promoted\",\"detail\":\"image ${IMAGE_SHA}\"}" \
+            && echo "deploy event reported" || echo "Atlas API unreachable — deploy event skipped"
