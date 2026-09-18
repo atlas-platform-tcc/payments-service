@@ -39,7 +39,7 @@ func main() {
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if host := os.Getenv("DB_HOST"); host != "" {
-			fmt.Fprintf(w, "hello from atlas walking skeleton (database: %s)\n", host)
+			fmt.Fprintf(w, " from atlas walking skeleton (database: %s)\n", host)
 			return
 		}
 		_, _ = w.Write([]byte("hello from atlas walking skeleton\n"))
